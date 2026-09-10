@@ -1,6 +1,4 @@
 // swift-tools-version: 6.0
-// The swift-tools-version declares the minimum version of Swift required to build this package.
-
 import PackageDescription
 
 let package = Package(
@@ -11,22 +9,16 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .library(
-            name: "Weaver",
-            targets: ["Weaver"]
-        ),
-    ],
-    dependencies: [
-        
+        .library(name: "Weaver", targets: ["Weaver"]),
+        .executable(name: "DependencyDemoApp", targets: ["DependencyDemoApp"])
     ],
     targets: [
-        .target(
-            name: "Weaver",
-            dependencies: []
+        .target(name: "Weaver"),
+        .target(name: "DependencyDemoFeature"),
+        .executableTarget(
+            name: "DependencyDemoApp",
+            dependencies: ["Weaver", "DependencyDemoFeature"]
         ),
-        .testTarget(
-            name: "WeaverTests",
-            dependencies: ["Weaver"]
-        ),
+        .testTarget(name: "WeaverTests", dependencies: ["Weaver"])
     ]
 )

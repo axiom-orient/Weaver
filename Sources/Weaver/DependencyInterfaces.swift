@@ -1,235 +1,289 @@
-// Sources/Weaver/DependencyInterfaces.swift
+#if canImport(os)
+  import os
+#else
+  public struct OSLogType: Sendable, Equatable {
+    public let rawValue: UInt8
 
-import Foundation
-import os
+    private init(_ rawValue: UInt8) { self.rawValue = rawValue }
 
-// MARK: - Core Context & Keys
+    public static let debug = Self(0)
+    public static let info = Self(1)
+    public static let `default` = Self(2)
+    public static let error = Self(3)
+    public static let fault = Self(4)
+  }
+#endif
 
-public enum DependencyContext: Sendable {
-    case live
-    case preview
-    case test
+/// Selects which registered implementation is active for a container.
+/// A non-live context falls back to the live registration when no context-specific registration exists.
+public enum DependencyContext: String, Sendable, Hashable, CustomStringConvertible {
+  case live
+  case preview
+  case test
+
+  public var description: String { rawValue }
 }
 
+/// A type-safe identity for one dependency value.
+/// Keep keys in the composition layer; feature and business types do not need to import Weaver.
 public protocol DependencyKey: Sendable {
-    associatedtype Value: Sendable
-    static var liveValue: Value { get }
-    static var previewValue: Value { get }
-    static var testValue: Value { get }
+  associatedtype Value: Sendable
 }
-
-public extension DependencyKey {
-    static var previewValue: Value { liveValue }
-    static var testValue: Value { liveValue }
-}
-
-// MARK: - Lifetime & Registration
 
 public enum DependencyLifetime: Sendable {
-    case singleton
-    case weakReference
-    case transient
+  case singleton
+  case weakReference
+  case transient
 }
 
-public struct DependencyRegistration: Sendable {
-    public let lifetime: DependencyLifetime
-    public let factory: @Sendable (DependencyResolver) async throws -> any Sendable
-    public let keyName: String
-    public let dependencies: Set<AnyDependencyKey>
-
-    public init(
-        lifetime: DependencyLifetime,
-        factory: @escaping @Sendable (DependencyResolver) async throws -> any Sendable,
-        keyName: String,
-        dependencies: Set<AnyDependencyKey> = []
-    ) {
-        self.lifetime = lifetime
-        self.factory = factory
-        self.keyName = keyName
-        self.dependencies = dependencies
-    }
+struct DependencyRegistration: Sendable {
+  let lifetime: DependencyLifetime
+  let factory: @Sendable (DependencyResolver) async throws -> any Sendable
+  let keyName: String
+  let dependencies: Set<AnyDependencyKey>
 }
 
-// MARK: - Resolver & Modules
+struct DependencyRegistrationSnapshot: Sendable {
+  let context: DependencyContext
+  let registrations: [AnyDependencyKey: DependencyRegistration]
+  let keys: Set<AnyDependencyKey>
 
+  init(
+    context: DependencyContext,
+    registrations: [AnyDependencyKey: DependencyRegistration]
+  ) {
+    self.context = context
+    self.registrations = registrations
+    self.keys = Set(registrations.keys)
+  }
+}
+
+/// Resolver access is intentionally limited to composition factories.
+/// Do not pass a resolver or container into feature/business objects.
 public protocol DependencyResolver: Sendable {
-    func resolve<Key: DependencyKey>(_ key: Key.Type) async throws -> Key.Value
+  func resolve<Key: DependencyKey>(_ key: Key.Type) async throws -> Key.Value
 }
 
 public protocol DependencyModule: Sendable {
-    func register(in registry: DependencyRegistry) async
+  func register(in registry: DependencyRegistry) async
 }
 
-// MARK: - Logging
-
 public protocol DependencyLogger: Sendable {
-    func log(_ message: String, level: OSLogType) async
-    func recordResolutionFailure(for key: String, error: Error) async
+  func log(_ message: String, level: OSLogType) async
+  func recordResolutionFailure(for key: String, error: Error) async
 }
 
 public actor DefaultDependencyLogger: DependencyLogger {
-    public nonisolated static let shared = DefaultDependencyLogger()
+  public nonisolated static let shared = DefaultDependencyLogger()
+
+  #if canImport(os)
     private let logger = Logger(subsystem: "com.weaver.di", category: "Dependency")
+  #endif
 
-    public init() {}
+  public init() {}
 
-    public func log(_ message: String, level: OSLogType) async {
-        logger.log(level: level, "\(message)")
-    }
+  public func log(_ message: String, level: OSLogType) async {
+    #if canImport(os)
+      logger.log(level: level, "\(message, privacy: .public)")
+    #else
+      _ = (message, level)
+    #endif
+  }
 
-    public func recordResolutionFailure(for key: String, error: Error) async {
-        logger.error("Resolution failed for \(key, privacy: .public): \(error.localizedDescription, privacy: .public)")
-    }
+  public func recordResolutionFailure(for key: String, error: Error) async {
+    #if canImport(os)
+      logger.error(
+        "Resolution failed for \(key, privacy: .public): \(String(describing: error), privacy: .public)"
+      )
+    #else
+      _ = (key, error)
+    #endif
+  }
 }
-
-// MARK: - AnyDependencyKey
 
 public struct AnyDependencyKey: Hashable, Sendable, CustomStringConvertible {
-    private let keyType: any DependencyKey.Type
-    private let identifier: String
-    private let objectID: ObjectIdentifier
+  private let identifier: String
+  private let objectID: ObjectIdentifier
 
-    public init<Key: DependencyKey>(_ key: Key.Type) {
-        self.keyType = key
-        self.identifier = String(describing: key)
-        self.objectID = ObjectIdentifier(key)
-    }
+  public init<Key: DependencyKey>(_ key: Key.Type) {
+    identifier = String(describing: key)
+    objectID = ObjectIdentifier(key)
+  }
 
-    public init<T: Sendable>(_ valueType: T.Type) {
-        self.keyType = _TemporaryKey<T>.self
-        self.identifier = String(describing: valueType)
-        self.objectID = ObjectIdentifier(_TemporaryKey<T>.self)
-    }
+  public var description: String { identifier }
 
-    public var description: String { identifier }
+  public func hash(into hasher: inout Hasher) { hasher.combine(objectID) }
 
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(objectID)
-    }
-
-    public static func == (lhs: AnyDependencyKey, rhs: AnyDependencyKey) -> Bool {
-        lhs.objectID == rhs.objectID
-    }
-
-    internal var originalType: any DependencyKey.Type { keyType }
+  public static func == (lhs: Self, rhs: Self) -> Bool { lhs.objectID == rhs.objectID }
 }
 
-private enum _TemporaryKey<T: Sendable>: DependencyKey {
-    static var liveValue: T { fatalError("Temporary keys are not meant to be resolved directly") }
+public enum DependencyConfigurationError: Error, Sendable, CustomStringConvertible {
+  case duplicateRegistrations([String])
+  case missingDependencies([String])
+  case circularDependency([String])
+
+  public var description: String {
+    switch self {
+    case .duplicateRegistrations(let keys):
+      "Duplicate dependency registrations: \(keys.joined(separator: ", "))"
+    case .missingDependencies(let missing):
+      "Missing dependencies: \(missing.joined(separator: ", "))"
+    case .circularDependency(let cycle):
+      "Circular dependency: \(cycle.joined(separator: " -> "))"
+    }
+  }
 }
 
-// MARK: - Graph Validation
+private struct DependencyRegistrationIdentity: Hashable, Sendable {
+  let key: AnyDependencyKey
+  let context: DependencyContext
 
-public enum DependencyValidationResult: Sendable {
-    case valid
-    case missing([String])
-    case circular([String])
+  var description: String { "\(key.description)@\(context.description)" }
 }
 
-public struct DependencyGraph {
-    private let registrations: [AnyDependencyKey: DependencyRegistration]
-
-    public init(registrations: [AnyDependencyKey: DependencyRegistration]) {
-        self.registrations = registrations
-    }
-
-    public func validate() -> DependencyValidationResult {
-        if let cycle = detectCycle() {
-            return .circular(cycle)
-        }
-
-        let missing = locateMissingDependencies()
-        if !missing.isEmpty {
-            return .missing(missing)
-        }
-
-        return .valid
-    }
-
-    private func detectCycle() -> [String]? {
-        var visiting: Set<AnyDependencyKey> = []
-        var visited: Set<AnyDependencyKey> = []
-        var stack: [AnyDependencyKey] = []
-
-        func dfs(_ key: AnyDependencyKey) -> [String]? {
-            if visiting.contains(key) {
-                if let start = stack.firstIndex(of: key) {
-                    let cycle = stack[start...] + [key]
-                    return cycle.map { $0.description }
-                }
-                return nil
-            }
-
-            if visited.contains(key) { return nil }
-
-            visiting.insert(key)
-            stack.append(key)
-
-            for dependency in registrations[key]?.dependencies ?? [] {
-                if let cycle = dfs(dependency) {
-                    return cycle
-                }
-            }
-
-            _ = stack.popLast()
-            visiting.remove(key)
-            visited.insert(key)
-            return nil
-        }
-
-        for key in registrations.keys {
-            if let cycle = dfs(key) {
-                return cycle
-            }
-        }
-        return nil
-    }
-
-    private func locateMissingDependencies() -> [String] {
-        var missing: [String] = []
-        for (key, registration) in registrations {
-            for dependency in registration.dependencies where registrations[dependency] == nil {
-                missing.append("\(key.description) depends on unregistered \(dependency.description)")
-            }
-        }
-        return missing
-    }
+private enum DependencyValidationResult {
+  case valid
+  case missing([String])
+  case circular([String])
 }
 
-// MARK: - DependencyRegistry
+private struct DependencyGraph {
+  let registrations: [AnyDependencyKey: DependencyRegistration]
+  let availableExternalKeys: Set<AnyDependencyKey>
 
+  func validate() -> DependencyValidationResult {
+    if let cycle = detectCycle() { return .circular(cycle) }
+    let missing = locateMissingDependencies()
+    return missing.isEmpty ? .valid : .missing(missing)
+  }
+
+  private func detectCycle() -> [String]? {
+    var visiting: Set<AnyDependencyKey> = []
+    var visited: Set<AnyDependencyKey> = []
+    var stack: [AnyDependencyKey] = []
+
+    func dfs(_ key: AnyDependencyKey) -> [String]? {
+      if visiting.contains(key), let start = stack.firstIndex(of: key) {
+        return (Array(stack[start...]) + [key]).map(\.description)
+      }
+      if visited.contains(key) { return nil }
+
+      visiting.insert(key)
+      stack.append(key)
+      let dependencies = (registrations[key]?.dependencies ?? [])
+        .filter { registrations[$0] != nil }
+        .sorted { $0.description < $1.description }
+      for dependency in dependencies {
+        if let cycle = dfs(dependency) { return cycle }
+      }
+      _ = stack.popLast()
+      visiting.remove(key)
+      visited.insert(key)
+      return nil
+    }
+
+    for key in registrations.keys.sorted(by: { $0.description < $1.description }) {
+      if let cycle = dfs(key) { return cycle }
+    }
+    return nil
+  }
+
+  private func locateMissingDependencies() -> [String] {
+    registrations.flatMap { key, registration in
+      registration.dependencies.compactMap { dependency in
+        registrations[dependency] == nil && !availableExternalKeys.contains(dependency)
+          ? "\(key.description) depends on unregistered \(dependency.description)"
+          : nil
+      }
+    }.sorted()
+  }
+}
+
+/// Mutable only while the composition root declares registrations.
+/// `DependencyContainer.build` finalizes this registry into an immutable snapshot.
 public actor DependencyRegistry {
-    private var registrations: [AnyDependencyKey: DependencyRegistration] = [:]
-    private let registryLogger = Logger(subsystem: "com.weaver.di", category: "DependencyRegistry")
+  private var registrationsByContext:
+    [DependencyContext: [AnyDependencyKey: DependencyRegistration]] = [:]
+  private var duplicateRegistrations: Set<DependencyRegistrationIdentity> = []
 
-    public init() {}
+  public init() {}
 
-    public func register<Key: DependencyKey>(
-        _ key: Key.Type,
-        lifetime: DependencyLifetime = .singleton,
-        dependsOn dependencies: [AnyDependencyKey] = [],
-        factory: @escaping @Sendable (DependencyResolver) async throws -> Key.Value
-    ) {
-        let dependencySet = Set(dependencies)
-        let anyKey = AnyDependencyKey(key)
+  public func register<Key: DependencyKey>(
+    _ key: Key.Type,
+    context: DependencyContext = .live,
+    lifetime: DependencyLifetime = .singleton,
+    dependsOn dependencies: [AnyDependencyKey] = [],
+    replacingExisting: Bool = false,
+    factory: @escaping @Sendable (DependencyResolver) async throws -> Key.Value
+  ) {
+    let identifier = AnyDependencyKey(key)
+    let identity = DependencyRegistrationIdentity(key: identifier, context: context)
+    var contextRegistrations = registrationsByContext[context, default: [:]]
 
-        if registrations[anyKey] != nil {
-            registryLogger.warning("Overwriting existing dependency registration for \(String(describing: key), privacy: .public)")
-        }
-
-        registrations[anyKey] = DependencyRegistration(
-            lifetime: lifetime,
-            factory: { resolver in try await factory(resolver) },
-            keyName: String(describing: key),
-            dependencies: dependencySet
-        )
+    if contextRegistrations[identifier] != nil {
+      guard replacingExisting else {
+        duplicateRegistrations.insert(identity)
+        return
+      }
+      duplicateRegistrations.remove(identity)
     }
 
-    internal func merge(_ newRegistrations: [AnyDependencyKey: DependencyRegistration]) {
-        registrations.merge(newRegistrations) { _, new in new }
+    contextRegistrations[identifier] = DependencyRegistration(
+      lifetime: lifetime,
+      factory: { resolver in try await factory(resolver) },
+      keyName: String(describing: key),
+      dependencies: Set(dependencies)
+    )
+    registrationsByContext[context] = contextRegistrations
+  }
+
+  public func registerWeak<Key: DependencyKey>(
+    _ key: Key.Type,
+    context: DependencyContext = .live,
+    dependsOn dependencies: [AnyDependencyKey] = [],
+    replacingExisting: Bool = false,
+    factory: @escaping @Sendable (DependencyResolver) async throws -> Key.Value
+  ) where Key.Value: AnyObject {
+    register(
+      key,
+      context: context,
+      lifetime: .weakReference,
+      dependsOn: dependencies,
+      replacingExisting: replacingExisting,
+      factory: factory
+    )
+  }
+
+  func finalize(
+    context: DependencyContext,
+    availableExternalKeys: Set<AnyDependencyKey> = []
+  ) throws -> DependencyRegistrationSnapshot {
+    let relevantContexts: Set<DependencyContext> = context == .live ? [.live] : [.live, context]
+    let duplicates =
+      duplicateRegistrations
+      .filter { relevantContexts.contains($0.context) }
+      .map(\.description)
+      .sorted()
+
+    guard duplicates.isEmpty else {
+      throw DependencyConfigurationError.duplicateRegistrations(duplicates)
     }
 
-    public func allRegistrations() -> [AnyDependencyKey: DependencyRegistration] {
-        registrations
+    var selected = registrationsByContext[.live] ?? [:]
+    if context != .live {
+      selected.merge(registrationsByContext[context] ?? [:]) { _, contextual in contextual }
     }
+
+    switch DependencyGraph(
+      registrations: selected,
+      availableExternalKeys: availableExternalKeys
+    ).validate() {
+    case .valid:
+      return DependencyRegistrationSnapshot(context: context, registrations: selected)
+    case .missing(let missing):
+      throw DependencyConfigurationError.missingDependencies(missing)
+    case .circular(let cycle):
+      throw DependencyConfigurationError.circularDependency(cycle)
+    }
+  }
 }

@@ -1,122 +1,114 @@
 # Weaver
 
-Weaver는 Swift 6 이상에서 사용할 수 있는 비동기 의존성 주입(Dependency Injection) 라이브러리입니다. 함수형 사고와 선언형 API를 기반으로, 모듈화된 등록과 타입 안전한 해석을 제공하며, 싱글톤/약한 참조/트랜지언트 수명을 명확하게 제어할 수 있습니다. 실행 컨텍스트(live/preview/test)에 따라 적절한 구현을 자동 선택하고, 샘플 실행 타깃(`DependencyDemoApp`)과 테스트 스위트(`DependencySystemTests`)로 즉시 검증할 수 있습니다.
+Weaver는 **서비스의 생성·선택·수명을 호출 코드에서 분리하고 typed async 해석으로 연결하는 작은 Swift DI 라이브러리**입니다.
 
-## 핵심 개념
+`DependencyContainer`는 composition root 안에서만 사용합니다. Feature/business 타입은 Weaver, container, resolver를 알 필요가 없으며 일반 생성자나 factory 인자로 완성된 의존성을 받습니다.
 
-| 파일 | 역할 |
-| --- | --- |
-| `DependencyInterfaces.swift` | `DependencyKey`, `DependencyLifetime`, `DependencyGraph`, `DependencyRegistry` 등 퍼블릭 인터페이스 정의 |
-| `DependencyContainer.swift` | 등록 정보를 바탕으로 의존성을 해석하고 수명(싱글톤/weak/트랜지언트)을 관리하는 Actor |
-| `DependencyKernel.swift` | 모듈 등록 → 그래프 검증 → 컨테이너 생성을 담당하는 Actor |
-| `DependencyManager.swift` | 전역 진입점(`Dependency` 네임스페이스 포함)으로 앱 어디서든 의존성에 접근 가능 |
-| `DependencyPropertyWrapper.swift` | `@DependencyValue` 프로퍼티 래퍼 구현, 선언형 접근 지원 |
-| `DependencyContextStore.swift` | live/preview/test 컨텍스트를 관리하는 Actor |
+## 핵심 흐름
 
-## 설치 (Swift Package Manager)
-
-```swift
-// Package.swift 예시
-dependencies: [
-    .package(url: "https://github.com/your-org/Weaver.git", from: "1.0.0")
-],
-.targets: [
-    .target(
-        name: "YourFeature",
-        dependencies: [
-            .product(name: "Weaver", package: "Weaver")
-        ]
-    )
-]
+```text
+DependencyModule
+→ DependencyRegistry
+→ context 선택 + graph finalization
+→ DependencyContainer
+→ root resolve
+→ 완성된 feature/business graph
 ```
 
-로컬 개발 중이라면 `.package(path: "../Weaver")` 처럼 상대 경로를 지정할 수 있습니다.
+Container 내부 factory만 `DependencyResolver`를 사용합니다.
 
-## 빠른 시작
+## 기능
 
-### 1. 의존성 키 정의
+- Swift 6 typed async registration / resolution
+- `.singleton`, `.weakReference`, `.transient`
+- `.live`, `.preview`, `.test` context별 구현 선택
+- non-live context에 등록이 없으면 `.live` 등록으로 명시적 fallback
+- duplicate/missing/declared-cycle fail-fast validation
+- runtime cycle detection과 concurrent singleton construction coalescing
+- child scope와 parent resolution
+- optional `WeaverMacros`
+
+## 사용
+
 ```swift
 import Weaver
 
-struct APIClientKey: DependencyKey {
-    static let liveValue = RealAPIClient()
-    static let previewValue = MockAPIClient()
-    static let testValue = MockAPIClient()
-}
-```
+protocol APIClient: Sendable {}
+struct LiveAPIClient: APIClient {}
+struct PreviewAPIClient: APIClient {}
 
-### 2. 모듈에서 등록
-```swift
-struct NetworkModule: DependencyModule {
+struct Feature: Sendable {
+    let api: any APIClient
+}
+
+enum APIClientKey: DependencyKey {
+    typealias Value = any APIClient
+}
+
+enum FeatureKey: DependencyKey {
+    typealias Value = Feature
+}
+
+struct AppModule: DependencyModule {
     func register(in registry: DependencyRegistry) async {
-        await registry.register(APIClientKey.self, lifetime: .singleton) { _ in
-            RealAPIClient()
+        await registry.register(APIClientKey.self) { _ in
+            LiveAPIClient()
+        }
+        await registry.register(APIClientKey.self, context: .preview) { _ in
+            PreviewAPIClient()
+        }
+        await registry.register(
+            FeatureKey.self,
+            dependsOn: [AnyDependencyKey(APIClientKey.self)]
+        ) { resolver in
+            Feature(api: try await resolver.resolve(APIClientKey.self))
         }
     }
 }
+
+let container = try await DependencyContainer.build(
+    modules: [AppModule()],
+    context: .live
+)
+let feature = try await container.resolve(FeatureKey.self)
 ```
 
-### 3. 부트스트랩 및 사용
+`feature`에는 container나 resolver를 전달하지 않습니다.
+
+## Context
+
+Context는 global mutable state가 아니라 **container 생성 configuration**입니다.
+
 ```swift
-// 앱 시작 시
-try await Dependency.bootstrap(with: [NetworkModule()])
-
-// 어디서든 사용
-let client = try await Dependency.resolve(APIClientKey.self)
+let preview = try await DependencyContainer.build(
+    modules: [AppModule()],
+    context: .preview
+)
 ```
 
-### 4. Property Wrapper 활용
-```swift
-struct FeatureCoordinator {
-    @DependencyValue(APIClientKey.self) private var apiClient
+동일 key의 `.preview` 등록이 있으면 그것을 선택하고, 없으면 `.live` 등록을 사용합니다. 각 container의 context는 생성 후 변경되지 않습니다.
 
-    func load() async {
-        let client = try await apiClient()
-        try await client.fetch()
-    }
-
-    func loadRequired() async throws {
-        let client = try await apiClient.require()
-        try await client.fetch()
-    }
-}
-```
-
-### 5. 테스트/프리뷰 컨텍스트
-```swift
-await Dependency.setContext(.test)
-let client = try await Dependency.resolve(APIClientKey.self) // Mock 반환
-await Dependency.setContext(.live)
-```
-
-
-## 테스트
+## 검증
 
 ```bash
 swift test
+swift build -c release -Xswiftc -warnings-as-errors
+swift run DependencyDemoApp
 ```
 
-`Tests/WeaverTests/DependencySystemTests.swift`는 다음을 검증합니다.
-- 커널 부트스트랩 후 싱글톤 팩토리가 1회만 호출되는지
-- 그래프 검증이 누락된 의존성을 탐지하는지
-- 동시 resolve 시 캐시가 공유되는지
-- 컨텍스트 변경 시 Preview/Test 값이 안전하게 반환되는지
-- weak 수명이 해제된 후 재생성되는지
+`DependencyDemoFeature` target은 Weaver에 의존하지 않습니다. Demo app의 composition root만 Weaver를 import합니다.
 
-## 수명 관리
+## 정본
 
-- `.singleton`: 한 번 생성한 값을 재사용합니다.
-- `.weakReference`: 클래스 타입만 지원하며, 참조가 해제되면 자동으로 캐시에서 제거됩니다.
-- `.transient`: 캐시에 저장하지 않고 매번 새 인스턴스를 반환합니다.
+- [IDENTITY_AND_EVOLUTION](docs/IDENTITY_AND_EVOLUTION.md)
+- [SPEC](docs/SPEC.md)
+- [ARCHITECTURE](docs/ARCHITECTURE.md)
+- [IMPLEMENTATION_STATUS](docs/IMPLEMENTATION_STATUS.md)
+- [PLAN](docs/PLAN.md)
+- [VALIDATION](docs/VALIDATION.md)
+- [RESEARCH](docs/RESEARCH.md)
+- [ANALYSIS](ANALYSIS.md)
 
-## 주의 사항
+## License
 
-- `.weakReference`는 클래스(`AnyObject`) 타입 + `Sendable`을 만족해야 합니다.
-- `Dependency.resolve`는 live 컨텍스트에서 실패하면 오류를 그대로 전파합니다. 안전한 기본값으로 폴백하려면 `DependencyKey`에 preview/test 값을 정의하거나 별도 전략을 사용하세요.
-- 컨텍스트 변경 이후에는 `Dependency.setContext(.live)`로 원상 복구하세요.
-- 동일 키를 여러 번 등록하면 마지막 등록이 사용되며, 런타임 경고가 출력됩니다.
-- 모듈 등록 시 명시적인 의존성을 `dependsOn:`로 선언하면 그래프 검증 정확도가 올라갑니다.
-
-## 라이선스
-
-MIT License. 자세한 내용은 `LICENSE` 파일을 확인하세요.
+MIT

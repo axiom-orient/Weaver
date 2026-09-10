@@ -39,8 +39,7 @@ DerivedData/
 # Credentials
 .netrc
 
-
-# Gemini
+# Other local instruction files
 GEMINI.md
 LANGUAGE.md
 TESTCASE.md
