@@ -70,3 +70,63 @@ Child는 parent와 같은 context를 사용한다. Child 등록이 같은 key의
 - context별 implementation 선택은 global state 변경 없이 서로 독립적이어야 한다.
 - declared graph 오류는 factory 실행 전에 실패해야 한다.
 - undeclared runtime cycle은 deadlock 대신 오류로 실패해야 한다.
+
+## 사용
+
+```swift
+import Weaver
+
+protocol APIClient: Sendable {}
+struct LiveAPIClient: APIClient {}
+struct PreviewAPIClient: APIClient {}
+
+struct Feature: Sendable {
+    let api: any APIClient
+}
+
+enum APIClientKey: DependencyKey {
+    typealias Value = any APIClient
+}
+
+enum FeatureKey: DependencyKey {
+    typealias Value = Feature
+}
+
+struct AppModule: DependencyModule {
+    func register(in registry: DependencyRegistry) async {
+        await registry.register(APIClientKey.self) { _ in
+            LiveAPIClient()
+        }
+        await registry.register(APIClientKey.self, context: .preview) { _ in
+            PreviewAPIClient()
+        }
+        await registry.register(
+            FeatureKey.self,
+            dependsOn: [AnyDependencyKey(APIClientKey.self)]
+        ) { resolver in
+            Feature(api: try await resolver.resolve(APIClientKey.self))
+        }
+    }
+}
+
+let container = try await DependencyContainer.build(
+    modules: [AppModule()],
+    context: .live
+)
+let feature = try await container.resolve(FeatureKey.self)
+```
+
+`feature`에는 container나 resolver를 전달하지 않습니다.
+
+## Context 사용 예제
+
+Context는 global mutable state가 아니라 **container 생성 configuration**입니다.
+
+```swift
+let preview = try await DependencyContainer.build(
+    modules: [AppModule()],
+    context: .preview
+)
+```
+
+동일 key의 `.preview` 등록이 있으면 그것을 선택하고, 없으면 `.live` 등록을 사용합니다. 각 container의 context는 생성 후 변경되지 않습니다.
